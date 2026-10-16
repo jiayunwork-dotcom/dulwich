@@ -4988,6 +4988,16 @@ class cmd_bisect(SuperCommand):
         replay_parser = subparsers.add_parser("replay", help="Replay bisect log")
         replay_parser.add_argument("logfile", help="Log file to replay")
 
+        # bisect run
+        run_parser = subparsers.add_parser(
+            "run", help="Use a script to automatically bisect"
+        )
+        run_parser.add_argument(
+            "command",
+            nargs=argparse.REMAINDER,
+            help="Command (and arguments) used to test each commit",
+        )
+
         # bisect help
         subparsers.add_parser("help", help="Show help")
 
@@ -4996,6 +5006,25 @@ class cmd_bisect(SuperCommand):
         if not parsed_args.subcommand:
             parser.print_help()
             return 1
+
+        def no_checkout_session() -> bool:
+            """Whether the current session keeps HEAD/work tree untouched."""
+            try:
+                with porcelain.open_repo_closing(None) as r:
+                    return os.path.exists(os.path.join(r.controldir(), "BISECT_HEAD"))
+            except porcelain.Error:
+                return False
+
+        def report_next(next_sha: bytes | None) -> None:
+            if not next_sha:
+                return
+            if no_checkout_session():
+                logger.info(
+                    "Bisecting: '%s' is the next commit to test",
+                    next_sha.decode("ascii"),
+                )
+            else:
+                logger.info("Bisecting: checking out '%s'", next_sha.decode("ascii"))
 
         try:
             if parsed_args.subcommand == "start":
@@ -5007,17 +5036,12 @@ class cmd_bisect(SuperCommand):
                     term_bad=parsed_args.term_bad,
                     term_good=parsed_args.term_good,
                 )
-                if next_sha:
-                    logger.info(
-                        "Bisecting: checking out '%s'", next_sha.decode("ascii")
-                    )
+                report_next(next_sha)
 
             elif parsed_args.subcommand == "bad":
                 next_sha = porcelain.bisect_bad(rev=parsed_args.rev)
                 if next_sha:
-                    logger.info(
-                        "Bisecting: checking out '%s'", next_sha.decode("ascii")
-                    )
+                    report_next(next_sha)
                 else:
                     # Bisect complete - find the first bad commit
                     with porcelain.open_repo_closing(None) as r:
@@ -5037,19 +5061,13 @@ class cmd_bisect(SuperCommand):
 
             elif parsed_args.subcommand == "good":
                 next_sha = porcelain.bisect_good(rev=parsed_args.rev)
-                if next_sha:
-                    logger.info(
-                        "Bisecting: checking out '%s'", next_sha.decode("ascii")
-                    )
+                report_next(next_sha)
 
             elif parsed_args.subcommand == "skip":
                 next_sha = porcelain.bisect_skip(
                     revs=parsed_args.revs if parsed_args.revs else None
                 )
-                if next_sha:
-                    logger.info(
-                        "Bisecting: checking out '%s'", next_sha.decode("ascii")
-                    )
+                report_next(next_sha)
 
             elif parsed_args.subcommand == "reset":
                 porcelain.bisect_reset(commit=parsed_args.commit)
@@ -5062,6 +5080,12 @@ class cmd_bisect(SuperCommand):
             elif parsed_args.subcommand == "replay":
                 porcelain.bisect_replay(None, log_file=parsed_args.logfile)
                 logger.info("Replayed bisect log from %s", parsed_args.logfile)
+
+            elif parsed_args.subcommand == "run":
+                command = parsed_args.command
+                if command and command[0] == "--":
+                    command = command[1:]
+                return porcelain.bisect_run(command=command)
 
             elif parsed_args.subcommand == "help":
                 parser.print_help()

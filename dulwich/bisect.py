@@ -21,15 +21,55 @@
 
 """Git bisect implementation."""
 
-__all__ = ["BisectState"]
+__all__ = [
+    "STEP_FIRST_BAD",
+    "STEP_NEXT",
+    "STEP_ONLY_SKIPPED",
+    "STEP_WAITING",
+    "BisectState",
+    "BisectStep",
+]
 
 import os
+import shlex
 from collections.abc import Sequence, Set
+from dataclasses import dataclass, field
 
 from dulwich.object_store import peel_sha
 from dulwich.objects import Commit, ObjectID
 from dulwich.refs import HEADREF, Ref
 from dulwich.repo import Repo
+
+#: Session does not yet have both a bad and a good revision.
+STEP_WAITING = "waiting"
+#: Another commit has been selected for testing.
+STEP_NEXT = "next"
+#: The first bad commit has been determined.
+STEP_FIRST_BAD = "first-bad"
+#: Every commit left in the bisection range was skipped.
+STEP_ONLY_SKIPPED = "only-skipped"
+
+
+@dataclass
+class BisectStep:
+    """Result of advancing a bisection.
+
+    Attributes:
+        kind: One of the ``STEP_*`` constants
+        commit: The next commit to test, or ``None`` when the bisection
+            cannot advance
+        possible: When ``kind`` is :data:`STEP_ONLY_SKIPPED`, the commits
+            (including the known bad one) that could be the first bad
+            commit
+        count: Number of revisions in the current bisection range,
+            including skipped revisions but excluding the bad revision and
+            the good revisions
+    """
+
+    kind: str
+    commit: ObjectID | None = None
+    possible: tuple[ObjectID, ...] = field(default_factory=tuple)
+    count: int = 0
 
 
 class BisectState:
@@ -43,11 +83,28 @@ class BisectState:
         """
         self.repo = repo
         self._bisect_dir = os.path.join(repo.controldir(), "BISECT_START")
+        self._bisect_head_file = os.path.join(repo.controldir(), "BISECT_HEAD")
+        self._last_step: BisectStep | None = None
 
     @property
     def is_active(self) -> bool:
         """Check if a bisect session is active."""
         return os.path.exists(self._bisect_dir)
+
+    @property
+    def no_checkout(self) -> bool:
+        """Check whether this session avoids touching HEAD and the work tree.
+
+        A session is in no-checkout mode while the ``BISECT_HEAD`` pseudo-ref
+        exists, mirroring the way git persists ``--no-checkout`` (and the
+        default used for bare repositories).
+        """
+        return os.path.exists(self._bisect_head_file)
+
+    @property
+    def last_step(self) -> BisectStep | None:
+        """The result of the most recent bisection step, if any."""
+        return self._last_step
 
     def start(
         self,
@@ -99,6 +156,16 @@ class BisectState:
         with open(self._bisect_dir, "wb") as f:
             f.write(current_branch)
 
+        if no_checkout:
+            # BISECT_HEAD marks a no-checkout session; it always points at
+            # the next commit to test and is read instead of HEAD when no
+            # revision is given to good/bad/skip.
+            if current_branch.startswith(b"refs/"):
+                start_sha = self.repo.refs[Ref(current_branch)]
+            else:
+                start_sha = ObjectID(current_branch)
+            self._set_bisect_head(start_sha)
+
         # Write BISECT_TERMS
         terms_file = os.path.join(self.repo.controldir(), "BISECT_TERMS")
         with open(terms_file, "w") as f:
@@ -117,7 +184,10 @@ class BisectState:
         # Initialize BISECT_LOG
         log_file = os.path.join(self.repo.controldir(), "BISECT_LOG")
         with open(log_file, "w") as f:
-            f.write("git bisect start\n")
+            if no_checkout:
+                f.write("git bisect start '--no-checkout'\n")
+            else:
+                f.write("git bisect start\n")
             f.write("# status: waiting for both good and bad commits\n")
 
         # Mark bad commit if provided
@@ -133,7 +203,8 @@ class BisectState:
         """Mark a commit as bad.
 
         Args:
-            rev: Commit SHA to mark as bad (defaults to HEAD)
+            rev: Commit SHA to mark as bad (defaults to HEAD, or to
+                ``BISECT_HEAD`` in a no-checkout session)
 
         Returns:
             The SHA of the next commit to test, or None if bisect is complete
@@ -142,7 +213,7 @@ class BisectState:
             raise ValueError("No bisect session in progress")
 
         if rev is None:
-            rev = self.repo.head()
+            rev = self._current_rev()
         else:
             rev = peel_sha(self.repo.object_store, rev)[1].id
 
@@ -163,7 +234,8 @@ class BisectState:
         """Mark a commit as good.
 
         Args:
-            rev: Commit SHA to mark as good (defaults to HEAD)
+            rev: Commit SHA to mark as good (defaults to HEAD, or to
+                ``BISECT_HEAD`` in a no-checkout session)
 
         Returns:
             The SHA of the next commit to test, or None if bisect is complete
@@ -172,7 +244,7 @@ class BisectState:
             raise ValueError("No bisect session in progress")
 
         if rev is None:
-            rev = self.repo.head()
+            rev = self._current_rev()
         else:
             rev = peel_sha(self.repo.object_store, rev)[1].id
 
@@ -195,7 +267,8 @@ class BisectState:
         """Skip one or more commits.
 
         Args:
-            revs: List of commits to skip (defaults to [HEAD])
+            revs: List of commits to skip (defaults to [HEAD], or to
+                ``BISECT_HEAD`` in a no-checkout session)
 
         Returns:
             The SHA of the next commit to test, or None if bisect is complete
@@ -204,7 +277,7 @@ class BisectState:
             raise ValueError("No bisect session in progress")
 
         if revs is None:
-            revs = [self.repo.head()]
+            revs = [self._current_rev()]
 
         for rev in revs:
             rev = peel_sha(self.repo.object_store, rev)[1].id
@@ -221,11 +294,16 @@ class BisectState:
     def reset(self, commit: ObjectID | None = None) -> None:
         """Reset bisect state and return to original branch/commit.
 
+        In a no-checkout session HEAD and the working tree are left
+        untouched.
+
         Args:
             commit: Optional commit to reset to (defaults to original branch/commit)
         """
         if not self.is_active:
             raise ValueError("No bisect session in progress")
+
+        no_checkout = self.no_checkout
 
         # Read original branch/commit
         with open(self._bisect_dir, "rb") as f:
@@ -239,6 +317,8 @@ class BisectState:
             "BISECT_LOG",
             "BISECT_EXPECTED_REV",
             "BISECT_ANCESTORS_OK",
+            "BISECT_HEAD",
+            "BISECT_RUN",
         ]:
             filepath = os.path.join(self.repo.controldir(), filename)
             if os.path.exists(filepath):
@@ -250,6 +330,11 @@ class BisectState:
             for filename in os.listdir(bisect_refs_dir):
                 os.remove(os.path.join(bisect_refs_dir, filename))
             os.rmdir(bisect_refs_dir)
+
+        if no_checkout:
+            # No-checkout sessions never moved HEAD; leave it as-is, even
+            # when an explicit commit was requested (matching git).
+            return
 
         # Reset to target commit/branch
         if commit is None:
@@ -284,7 +369,12 @@ class BisectState:
             if line.startswith("#") or not line:
                 continue
 
-            parts = line.split()
+            # Log entries are shell-quoted, e.g.
+            # "git bisect start '--no-checkout'"
+            try:
+                parts = shlex.split(line)
+            except ValueError:
+                parts = line.split()
             if len(parts) < 3 or parts[0] != "git" or parts[1] != "bisect":
                 continue
 
@@ -292,7 +382,7 @@ class BisectState:
             args = parts[3:] if len(parts) > 3 else []
 
             if cmd == "start":
-                self.start()
+                self.start(no_checkout="--no-checkout" in args)
             elif cmd == "bad":
                 rev = ObjectID(args[0].encode("ascii")) if args else None
                 self.mark_bad(rev)
@@ -303,46 +393,124 @@ class BisectState:
                 revs = [ObjectID(arg.encode("ascii")) for arg in args] if args else None
                 self.skip(revs)
 
+    def _current_rev(self) -> ObjectID:
+        """The revision currently under test.
+
+        Reads ``BISECT_HEAD`` in a no-checkout session, otherwise HEAD.
+        """
+        if self.no_checkout:
+            with open(self._bisect_head_file, "rb") as f:
+                return ObjectID(f.read().strip())
+        return self.repo.head()
+
+    def _set_bisect_head(self, rev: ObjectID) -> None:
+        """Point BISECT_HEAD at the given revision."""
+        with open(self._bisect_head_file, "wb") as f:
+            f.write(rev + b"\n")
+
+    @property
+    def bisect_head(self) -> ObjectID | None:
+        """The SHA recorded in ``BISECT_HEAD``.
+
+        None when not bisecting in no-checkout mode.
+        """
+        if not self.no_checkout:
+            return None
+        with open(self._bisect_head_file, "rb") as f:
+            return ObjectID(f.read().strip())
+
+    def _refs(self, prefix: str) -> list[ObjectID]:
+        """Read all refs/bisect/<prefix>-<sha> markers (or 'bad')."""
+        bisect_refs_dir = os.path.join(self.repo.controldir(), "refs", "bisect")
+        results: list[ObjectID] = []
+        if not os.path.isdir(bisect_refs_dir):
+            return results
+        for filename in sorted(os.listdir(bisect_refs_dir)):
+            if filename == prefix or filename.startswith(prefix + "-"):
+                with open(os.path.join(bisect_refs_dir, filename), "rb") as f:
+                    results.append(ObjectID(f.read().strip()))
+        return results
+
+    def bad_commits(self) -> list[ObjectID]:
+        """Return the marked bad revision (at most one), if any."""
+        return self._refs("bad")
+
+    def good_commits(self) -> list[ObjectID]:
+        """Return all marked good revisions."""
+        return self._refs("good")
+
+    def skip_commits(self) -> list[ObjectID]:
+        """Return all skipped revisions."""
+        return self._refs("skip")
+
+    def _compute_next(self) -> BisectStep:
+        """Compute the next bisection step without recording it."""
+        bad_shas = self._refs("bad")
+        if not bad_shas:
+            return BisectStep(STEP_WAITING)
+        bad_sha = bad_shas[0]
+
+        good_shas = self._refs("good")
+        if not good_shas:
+            return BisectStep(STEP_WAITING)
+
+        skip_shas = set(self._refs("skip"))
+
+        # Find commits between good and bad (skipped commits are walked
+        # through so that they never exclude untested ancestors)
+        candidates = self._find_bisect_candidates(bad_sha, good_shas, skip_shas)
+
+        if not candidates:
+            # Nothing left between the endpoints: the bad revision itself
+            # is the first bad commit.
+            return BisectStep(
+                STEP_FIRST_BAD, commit=bad_sha, possible=(bad_sha,), count=0
+            )
+
+        testable = [sha for sha in candidates if sha not in skip_shas]
+
+        if not testable:
+            # Every remaining revision was skipped.
+            possible = (bad_sha, *[sha for sha in candidates if sha in skip_shas])
+            return BisectStep(
+                STEP_ONLY_SKIPPED, possible=possible, count=len(candidates)
+            )
+
+        # Find midpoint, avoiding skipped revisions: pick the testable
+        # revision closest to the regular midpoint.
+        mid_idx = len(candidates) // 2
+
+        def distance(index: int) -> tuple[int, int]:
+            return (abs(index - mid_idx), index)
+
+        best_idx = min(
+            (i for i, sha in enumerate(candidates) if sha not in skip_shas),
+            key=distance,
+        )
+        next_commit = candidates[best_idx]
+        return BisectStep(STEP_NEXT, commit=next_commit, count=len(candidates))
+
     def _find_next_commit(self) -> ObjectID | None:
         """Find the next commit to test using binary search.
 
         Returns:
             The SHA of the next commit to test, or None if bisect is complete
         """
-        # Get bad commit
-        bad_ref_path = os.path.join(self.repo.controldir(), "refs", "bisect", "bad")
-        if not os.path.exists(bad_ref_path):
-            self._append_to_log("# status: waiting for both good and bad commits")
+        step = self._compute_next()
+        self._last_step = step
+
+        if step.kind == STEP_WAITING:
+            if not self._refs("bad"):
+                self._append_to_log("# status: waiting for both good and bad commits")
+            else:
+                self._append_to_log(
+                    "# status: waiting for good commit(s), bad commit known"
+                )
             return None
 
-        with open(bad_ref_path, "rb") as f:
-            bad_sha = ObjectID(f.read().strip())
-
-        # Get all good commits
-        good_shas: list[ObjectID] = []
-        bisect_refs_dir = os.path.join(self.repo.controldir(), "refs", "bisect")
-        for filename in os.listdir(bisect_refs_dir):
-            if filename.startswith("good-"):
-                with open(os.path.join(bisect_refs_dir, filename), "rb") as f:
-                    good_shas.append(ObjectID(f.read().strip()))
-
-        if not good_shas:
-            self._append_to_log(
-                "# status: waiting for good commit(s), bad commit known"
-            )
-            return None
-
-        # Get skip commits
-        skip_shas: set[ObjectID] = set()
-        for filename in os.listdir(bisect_refs_dir):
-            if filename.startswith("skip-"):
-                with open(os.path.join(bisect_refs_dir, filename), "rb") as f:
-                    skip_shas.add(ObjectID(f.read().strip()))
-
-        # Find commits between good and bad
-        candidates = self._find_bisect_candidates(bad_sha, good_shas, skip_shas)
-
-        if not candidates:
+        if step.kind == STEP_FIRST_BAD:
+            bad_sha = step.commit
+            assert bad_sha is not None
             # Bisect complete - the first bad commit is found
             self._append_to_log(
                 f"# first bad commit: [{bad_sha.decode('ascii')}] "
@@ -350,19 +518,32 @@ class BisectState:
             )
             return None
 
-        # Find midpoint
-        mid_idx = len(candidates) // 2
-        next_commit = candidates[mid_idx]
+        if step.kind == STEP_ONLY_SKIPPED:
+            self._append_to_log("# only skipped commits left to test")
+            for sha in step.possible:
+                self._append_to_log(
+                    f"# possible first bad commit: [{sha.decode('ascii')}] "
+                    f"{self._get_commit_subject(sha)}"
+                )
+            return None
+
+        next_commit = step.commit
+        assert next_commit is not None
 
         # Write BISECT_EXPECTED_REV
         expected_file = os.path.join(self.repo.controldir(), "BISECT_EXPECTED_REV")
         with open(expected_file, "wb") as f:
             f.write(next_commit + b"\n")
 
+        if self.no_checkout:
+            # Make the next revision available via BISECT_HEAD and leave
+            # HEAD and the working tree alone.
+            self._set_bisect_head(next_commit)
+
         # Update status in log
-        steps_remaining = self._estimate_steps(len(candidates))
+        steps_remaining = self._estimate_steps(step.count)
         self._append_to_log(
-            f"Bisecting: {len(candidates) - 1} revisions left to test after this "
+            f"Bisecting: {step.count - 1} revisions left to test after this "
             f"(roughly {steps_remaining} steps)"
         )
         self._append_to_log(
@@ -376,42 +557,42 @@ class BisectState:
     ) -> list[ObjectID]:
         """Find all commits between good and bad commits.
 
+        Skipped commits remain part of the range (and are walked through),
+        so they can never cause untested ancestors to be excluded.
+
         Args:
             bad_sha: The bad commit SHA
             good_shas: List of good commit SHAs
             skip_shas: Set of commits to skip
 
         Returns:
-            List of candidate commit SHAs in topological order
+            List of candidate commit SHAs in traversal order, excluding the
+            bad commit itself and all good commits
         """
-        # Use git's graph walking to find commits
-        # This is a simplified version - a full implementation would need
-        # to handle merge commits properly
+        good = set(good_shas)
         candidates: list[ObjectID] = []
-        visited: set[ObjectID] = set(good_shas)
+        visited: set[ObjectID] = set(good)
         queue: list[ObjectID] = [bad_sha]
 
         while queue:
             sha = queue.pop(0)
-            if sha in visited or sha in skip_shas:
+            if sha in visited:
                 continue
 
             visited.add(sha)
-            commit = self.repo.object_store[sha]
 
-            # Don't include good commits
-            if sha not in good_shas:
+            if sha != bad_sha:
+                # The bad commit itself is not a test candidate.
                 candidates.append(sha)
 
-            # Add parents to queue
+            commit = self.repo.object_store[sha]
+
+            # Add parents to queue; skipped commits are traversed like any
+            # other commit so their ancestors stay in the candidate set.
             if isinstance(commit, Commit):
                 for parent in commit.parents:
                     if parent not in visited:
                         queue.append(parent)
-
-        # Remove the bad commit itself
-        if bad_sha in candidates:
-            candidates.remove(bad_sha)
 
         return candidates
 

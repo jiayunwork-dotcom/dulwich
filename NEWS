@@ -1,5 +1,16 @@
 1.2.19	UNRELEASED
 
+ * ``bisect --no-checkout`` now stays in effect for the whole session:
+   subsequent ``good``/``bad``/``skip`` commands no longer move HEAD or
+   rewrite the working tree, the next commit to test is published via
+   ``BISECT_HEAD``, and bare repositories default to no-checkout mode.
+
+ * Add ``bisect run`` (and ``porcelain.bisect_run``) to drive a bisection
+   automatically with a test script, using the same exit-code conventions
+   as git. Interrupting the run leaves the session in place (without
+   leaving the script running) so it can be resumed, and skipped commits
+   no longer exclude their untested ancestors from the bisection.
+
  * In ``update_working_tree``, leave a path alone when one of its leading
    directories has been replaced by a symlink, rather than following the
    symlink and removing a file outside the work tree. (Kartik Kenchi)

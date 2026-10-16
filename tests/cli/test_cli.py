@@ -30,6 +30,8 @@ import logging
 import os
 import re
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -1174,6 +1176,133 @@ class TagCommandTest(DulwichCliTestCase):
         # Create tag
         _result, _stdout, _stderr = self._run_cli("tag", "v1.0")
         self.assertIn(b"refs/tags/v1.0", self.repo.refs.keys())
+
+
+class BisectCommandTest(DulwichCliTestCase):
+    """Tests for the bisect command."""
+
+    def _create_commits(self, n=7):
+        shas = []
+        for i in range(1, n + 1):
+            with open(os.path.join(self.repo_path, "f"), "w") as f:
+                f.write(f"v{i}\n")
+            self._run_cli("add", "f")
+            self._run_cli("commit", f"--message=c{i}")
+            shas.append(self.repo.head())
+        return shas
+
+    def _script(self, body):
+        path = os.path.join(self.test_dir, "bisect-test.sh")
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def _bad_ref(self):
+        with open(
+            os.path.join(self.repo.controldir(), "refs", "bisect", "bad"), "rb"
+        ) as f:
+            return f.read().strip()
+
+    def test_bisect_run(self):
+        shas = self._create_commits()
+        self._run_cli("bisect", "start", shas[-1].decode(), shas[0].decode())
+        script = self._script("test \"$(cat f | tr -d 'v\\n')\" -le 3")
+        result, _stdout, _stderr = self._run_cli("bisect", "run", script)
+        self.assertEqual(0, result)
+        self.assertEqual(shas[3], self._bad_ref())
+        self._run_cli("bisect", "reset")
+
+    def test_bisect_run_exit_code_mapping(self):
+        shas = self._create_commits()
+        self._run_cli("bisect", "start", shas[-1].decode(), shas[0].decode())
+        # >= 128 aborts the run with the normalized script exit code.
+        result, _stdout, _stderr = self._run_cli(
+            "bisect", "run", self._script("exit 130")
+        )
+        self.assertEqual((-130) & 0xFF, result)
+        refs = os.listdir(os.path.join(self.repo.controldir(), "refs", "bisect"))
+        self.assertEqual({"bad", f"good-{shas[0].decode()}"}, set(refs))
+        # 125 everywhere skips until no testable commit remains.
+        result, _stdout, _stderr = self._run_cli(
+            "bisect", "run", self._script("exit 125")
+        )
+        self.assertEqual(2, result)
+        self._run_cli("bisect", "reset")
+
+    def test_bisect_run_no_checkout_session(self):
+        shas = self._create_commits()
+        original_head = self.repo.head()
+        self._run_cli(
+            "bisect",
+            "start",
+            "--no-checkout",
+            shas[-1].decode(),
+            shas[0].decode(),
+        )
+        bisect_head = os.path.join(self.repo.controldir(), "BISECT_HEAD")
+        self.assertTrue(os.path.exists(bisect_head))
+        good = ",".join(s.decode() for s in shas[:3])
+        script = self._script(
+            "case ',"
+            + good
+            + ',\' in *"$(cat .git/BISECT_HEAD)"*) exit 0;; *) exit 1;; esac'
+        )
+        result, _stdout, _stderr = self._run_cli("bisect", "run", script)
+        self.assertEqual(0, result)
+        self.assertEqual(shas[3], self._bad_ref())
+        # HEAD/work tree were never touched.
+        self.assertEqual(original_head, self.repo.head())
+        with open(os.path.join(self.repo_path, "f")) as f:
+            self.assertEqual("v7\n", f.read())
+        self._run_cli("bisect", "reset")
+        self.assertFalse(os.path.exists(bisect_head))
+
+    @skipIf(os.name != "posix", "process group signals are POSIX specific")
+    def test_bisect_run_interrupted_kills_script(self):
+        shas = self._create_commits()
+        self._run_cli("bisect", "start", shas[-1].decode(), shas[0].decode())
+        script = self._script("sleep 42")
+
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "dulwich.cli", "bisect", "run", script],
+            cwd=self.repo_path,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        time.sleep(1.0)
+        self.assertTrue(proc.poll() is None)
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            self.fail("dulwich did not exit when interrupted")
+        # No script process is left behind.
+        time.sleep(0.3)
+        pgrep = subprocess.run(
+            ["pgrep", "-f", "sleep 42"], capture_output=True, text=True
+        )
+        self.assertEqual("", pgrep.stdout.strip())
+        # ... but the session survives and can be resumed.
+        self.assertTrue(
+            os.path.exists(os.path.join(self.repo.controldir(), "BISECT_START"))
+        )
+        result, _stdout, _stderr = self._run_cli(
+            "bisect",
+            "run",
+            self._script("test \"$(cat f | tr -d 'v\\n')\" -le 3"),
+        )
+        self.assertEqual(0, result)
+        self.assertEqual(shas[3], self._bad_ref())
+        self._run_cli("bisect", "reset")
 
 
 class VerifyCommitCommandTest(DulwichCliTestCase):

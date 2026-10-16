@@ -26,7 +26,7 @@ Currently implemented:
  * apply_patch
  * archive
  * add
- * bisect{_start,_bad,_good,_skip,_reset,_log,_replay}
+ * bisect{_start,_bad,_good,_skip,_reset,_log,_replay,_run}
  * branch{_create,_delete,_list}
  * check_ignore
  * checkout
@@ -115,6 +115,7 @@ __all__ = [
     "bisect_log",
     "bisect_replay",
     "bisect_reset",
+    "bisect_run",
     "bisect_skip",
     "bisect_start",
     "blame",
@@ -308,7 +309,10 @@ import logging
 import os
 import posixpath
 import re
+import shlex
+import signal
 import stat
+import subprocess
 import sys
 import time
 from collections import namedtuple
@@ -351,7 +355,11 @@ if TYPE_CHECKING:
     from ..merge import MergeConflictInfo
     from ..objects import RawObjectID
 from ..archive import tar_stream
-from ..bisect import BisectState
+from ..bisect import (
+    STEP_FIRST_BAD,
+    STEP_ONLY_SKIPPED,
+    BisectState,
+)
 from ..client import (
     FetchPackResult,
     LsRemoteResult,
@@ -9275,29 +9283,39 @@ def bisect_start(
         bad_sha = parse_commit(r, bad).id if bad else None
         good_shas = [parse_commit(r, g).id for g in good] if good else None
 
+        # Bare repositories never have a working tree to check out, so
+        # they behave as if --no-checkout had been given (like git).
+        no_checkout = no_checkout or r.bare
+
         state.start(bad_sha, good_shas, paths, no_checkout, term_bad, term_good)
 
         # Return the next commit to test if we have both good and bad
         if bad_sha and good_shas:
             next_sha = state._find_next_commit()
-            if next_sha and not no_checkout:
-                # Checkout the next commit
-                old_commit = r[r.head()]
-                assert isinstance(old_commit, Commit)
-                old_tree = old_commit.tree if r.head() else None
-                r.refs[HEADREF] = next_sha
-                commit = r[next_sha]
-                assert isinstance(commit, Commit)
-                changes = tree_changes(r.object_store, old_tree, commit.tree)
-                update_working_tree(
-                    r,
-                    old_tree,
-                    commit.tree,
-                    change_iterator=changes,
-                    config=r.get_config_stack(),
-                )
+            if next_sha and not state.no_checkout:
+                _bisect_checkout(r, next_sha)
             return next_sha
         return None
+
+
+def _bisect_checkout(r: Repo, next_sha: bytes) -> None:
+    """Check out a bisection revision, updating HEAD and the working tree."""
+    try:
+        old_commit = r[r.head()]
+    except KeyError:
+        old_commit = None
+    old_tree = old_commit.tree if isinstance(old_commit, Commit) else None
+    r.refs[HEADREF] = next_sha
+    commit = r[next_sha]
+    assert isinstance(commit, Commit)
+    changes = tree_changes(r.object_store, old_tree, commit.tree)
+    update_working_tree(
+        r,
+        old_tree,
+        commit.tree,
+        change_iterator=changes,
+        config=r.get_config_stack(),
+    )
 
 
 def bisect_bad(
@@ -9318,22 +9336,9 @@ def bisect_bad(
         rev_sha = parse_commit(r, rev).id if rev else None
         next_sha = state.mark_bad(rev_sha)
 
-        if next_sha:
+        if next_sha and not state.no_checkout:
             # Checkout the next commit
-            old_commit = r[r.head()]
-            assert isinstance(old_commit, Commit)
-            old_tree = old_commit.tree if r.head() else None
-            r.refs[HEADREF] = next_sha
-            commit = r[next_sha]
-            assert isinstance(commit, Commit)
-            changes = tree_changes(r.object_store, old_tree, commit.tree)
-            update_working_tree(
-                r,
-                old_tree,
-                commit.tree,
-                change_iterator=changes,
-                config=r.get_config_stack(),
-            )
+            _bisect_checkout(r, next_sha)
 
         return next_sha
 
@@ -9356,22 +9361,9 @@ def bisect_good(
         rev_sha = parse_commit(r, rev).id if rev else None
         next_sha = state.mark_good(rev_sha)
 
-        if next_sha:
+        if next_sha and not state.no_checkout:
             # Checkout the next commit
-            old_commit = r[r.head()]
-            assert isinstance(old_commit, Commit)
-            old_tree = old_commit.tree if r.head() else None
-            r.refs[HEADREF] = next_sha
-            commit = r[next_sha]
-            assert isinstance(commit, Commit)
-            changes = tree_changes(r.object_store, old_tree, commit.tree)
-            update_working_tree(
-                r,
-                old_tree,
-                commit.tree,
-                change_iterator=changes,
-                config=r.get_config_stack(),
-            )
+            _bisect_checkout(r, next_sha)
 
         return next_sha
 
@@ -9407,22 +9399,9 @@ def bisect_skip(
 
         next_sha = state.skip(rev_shas)
 
-        if next_sha:
+        if next_sha and not state.no_checkout:
             # Checkout the next commit
-            old_commit = r[r.head()]
-            assert isinstance(old_commit, Commit)
-            old_tree = old_commit.tree if r.head() else None
-            r.refs[HEADREF] = next_sha
-            commit = r[next_sha]
-            assert isinstance(commit, Commit)
-            changes = tree_changes(r.object_store, old_tree, commit.tree)
-            update_working_tree(
-                r,
-                old_tree,
-                commit.tree,
-                change_iterator=changes,
-                config=r.get_config_stack(),
-            )
+            _bisect_checkout(r, next_sha)
 
         return next_sha
 
@@ -9439,6 +9418,12 @@ def bisect_reset(
     """
     with open_repo_closing(repo) as r:
         state = BisectState(r)
+        if state.no_checkout:
+            # No-checkout sessions never moved HEAD or the working tree;
+            # just clean up the bisection state.
+            state.reset(parse_commit(r, commit).id if commit else None)
+            return
+
         # Get old tree before reset
         try:
             old_commit = r[r.head()]
@@ -9504,6 +9489,212 @@ def bisect_replay(
             log_content = content.decode() if isinstance(content, bytes) else content
 
         state.replay(log_content)
+
+
+def _terminate_bisect_process(process: subprocess.Popen) -> None:
+    """Terminate a bisect run child and wait for it.
+
+    The child runs in its own process group/session, so terminating the
+    group also kills any processes spawned by the test script.
+    """
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+    else:
+        process.kill()
+    process.wait()
+
+
+def _run_bisect_command(command_string: str, cwd: str | None) -> int:
+    """Run a bisect test command through the shell.
+
+    The command runs in a new process group so that it (and any children
+    it spawned) can be cleaned up if the run is interrupted, leaving no
+    script processes behind.
+    """
+    popen_kwargs: dict[str, Any] = {"shell": True, "cwd": cwd}
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    process = subprocess.Popen(command_string, **popen_kwargs)
+    try:
+        return process.wait()
+    except BaseException:
+        _terminate_bisect_process(process)
+        raise
+
+
+def _bisect_verify_good(r: Repo, state: BisectState, run_command) -> int:
+    """Run the test command against a known-good revision.
+
+    Used to distinguish a script that cannot be executed (exit code 126
+    or 127) from a revision that is genuinely bad. The previously tested
+    revision is restored afterwards, even if verification fails.
+    """
+    good_revs = state.good_commits()
+    if not good_revs:
+        return -1
+    good_rev = good_revs[0]
+    current_rev = state._current_rev()
+    try:
+        if state.no_checkout:
+            state._set_bisect_head(good_rev)
+        else:
+            _bisect_checkout(r, good_rev)
+        return run_command()
+    finally:
+        if state.no_checkout:
+            state._set_bisect_head(current_rev)
+        else:
+            _bisect_checkout(r, current_rev)
+
+
+def bisect_run(
+    repo: str | os.PathLike[str] | Repo | None = None,
+    command: str | Sequence[str] | None = None,
+) -> int:
+    """Use a script to automatically drive a bisect session.
+
+    The command is run repeatedly against the revision currently under
+    test; its exit code decides how to mark that revision, using the
+    same conventions as ``git bisect run``:
+
+    - 0: the revision is good
+    - 1-124 (inclusive), 126 and 127: the revision is bad
+    - 125: the revision cannot be tested; it is skipped
+    - below 0 or 128 and above: the run is aborted; the bisection state
+      is left in place so the run can be resumed
+
+    On the first run only, exit codes 126 and 127 are cross-checked
+    against a known-good revision to avoid aborting because of a missing
+    or non-executable script.
+
+    Runs in a ``--no-checkout`` session (the default for bare
+    repositories) never move HEAD or update the working tree; the
+    command can read the revision to test from ``BISECT_HEAD``.
+
+    Args:
+        repo: Path to repository or a Repo object
+        command: Shell command string, or argv of the command and its
+            arguments
+
+    Returns:
+        0 when the first bad commit has been found, 2 when only skipped
+        revisions remain, 1 for usage failures, or the normalized command
+        exit code (``(-code) & 0xff``) when the command aborted the run
+    """
+    with open_repo_closing(repo) as r:
+        state = BisectState(r)
+
+        if not state.is_active:
+            raise Error(
+                'You need to start by "git bisect start".\n'
+                "You then need to give me at least one good and bad "
+                "revision."
+            )
+
+        if not state.bad_commits() or not state.good_commits():
+            raise Error(
+                "You need to give me at least one good and bad revision.\n"
+                'You can use "git bisect good" and "git bisect bad" for that.'
+            )
+
+        if command is None:
+            raise Error("bisect run failed: no command provided.")
+        if isinstance(command, str):
+            command_string = command
+        else:
+            argv = list(command)
+            if not argv:
+                raise Error("bisect run failed: no command provided.")
+            command_string = " ".join(shlex.quote(arg) for arg in argv)
+
+        workdir = None if r.bare else os.path.abspath(os.fspath(r.path))
+
+        def run_command() -> int:
+            logger.info("running %s", command_string)
+            return _run_bisect_command(command_string, workdir)
+
+        is_first_run = True
+        while True:
+            rev = state._current_rev()
+            res = run_command()
+
+            # Exit code 126 and 127 can either come from the shell if it
+            # was unable to execute or find the script, or from the script
+            # itself. Check against a known-good revision on the first run
+            # to avoid trashing the bisect due to a broken script.
+            if is_first_run and res in (126, 127):
+                is_first_run = False
+                try:
+                    good_rc = _bisect_verify_good(r, state, run_command)
+                except Exception:
+                    # Checking out / restoring revisions failed, but
+                    # interrupts and system exits must still propagate.
+                    logger.error(
+                        "unable to verify '%s' on good revision", command_string
+                    )
+                    return 1
+                if good_rc < 0:
+                    logger.error(
+                        "unable to verify '%s' on good revision", command_string
+                    )
+                    return 1
+                if good_rc == res:
+                    logger.error("bogus exit code %d for good revision", good_rc)
+                    return 1
+
+            if is_first_run:
+                is_first_run = False
+
+            if res < 0 or res >= 128:
+                logger.error(
+                    "bisect run failed: exit code %d from '%s' is < 0 or >= 128",
+                    res,
+                    command_string,
+                )
+                return (-res) & 0xFF
+
+            if res == 125:
+                next_sha = state.skip([rev])
+            elif res == 0:
+                next_sha = state.mark_good(rev)
+            else:
+                next_sha = state.mark_bad(rev)
+
+            if next_sha and not state.no_checkout:
+                _bisect_checkout(r, next_sha)
+
+            step = state.last_step
+            if step is not None and step.kind == STEP_FIRST_BAD:
+                bad_shas = state.bad_commits()
+                if bad_shas:
+                    bad_sha = bad_shas[0]
+                    logger.info("%s is the first bad commit", bad_sha.decode("ascii"))
+                    logger.info(
+                        "    %s",
+                        state._get_commit_subject(bad_sha),
+                    )
+                logger.info("bisect found first bad commit")
+                return 0
+
+            if step is not None and step.kind == STEP_ONLY_SKIPPED:
+                logger.error("There are only 'skip'ped commits left to test.")
+                logger.error("The first bad commit could be any of:")
+                for sha in step.possible:
+                    logger.error("%s", sha.decode("ascii"))
+                logger.error("We cannot bisect more!")
+                logger.error("bisect run cannot continue any more")
+                return 2
 
 
 def reflog(
